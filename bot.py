@@ -20,7 +20,6 @@ from staff_application import StaffApplicationManager
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
 DATA_PATH = BASE / "tickets.json"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("arvex-ticket")
 
@@ -53,7 +52,7 @@ AI_ENABLED_DEFAULT = bool(CONFIG.get("ai_enabled_by_default", True))
 MAX_HISTORY = int(CONFIG.get("ai_max_history", 16))
 COOLDOWN = float(CONFIG.get("ai_cooldown_seconds", 2.0))
 STAFF_APP_CATEGORY = CONFIG.get("staff_application_category_id")
-STAFF_REVIEW_CHANNEL_ID = int(CONFIG.get("staff_application_review_channel_id", 1540995984845316097) or 0)
+STAFF_REVIEW_CHANNEL_ID = int(CONFIG.get("staff_application_review_channel_id", 0) or 0)
 
 
 def save_config():
@@ -128,6 +127,9 @@ class TicketBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlView())
+        for channel_id, record in TICKETS.items():
+            if record.get("category") == "staff_application" and record.get("staff_application_evaluation"):
+                self.add_view(StaffReviewView(record.get("user_id", 0), int(channel_id)))
         for guild_id in GUILD_IDS:
             try:
                 guild = discord.Object(id=guild_id)
@@ -162,17 +164,20 @@ class TicketBot(commands.Bot):
         state = self.staff_apps.state(message.channel.id)
         if not state:
             state = self.staff_apps.start(message.channel.id, record["user_id"])
-            record["staff_application"] = True
-            save_tickets()
-            question = self.staff_apps.next_question(message.channel.id)
-            if question:
-                await message.channel.send(question, allowed_mentions=discord.AllowedMentions.none())
-            return
+            saved = record.get("staff_application_answers", {})
+            if saved:
+                state["answers"] = dict(saved)
+                state["question_index"] = len(saved)
+            state["completed"] = record.get("staff_application_status") == "submitted"
         if state.get("completed"):
             return
         ok, next_question = self.staff_apps.accept_answer(message.channel.id, message.content)
         if not ok:
             return
+        record["staff_application"] = True
+        record["staff_application_answers"] = dict(state.get("answers", {}))
+        record["staff_application_status"] = "in_progress"
+        save_tickets()
         if next_question:
             await message.channel.send(next_question, allowed_mentions=discord.AllowedMentions.none())
             return
@@ -206,8 +211,7 @@ class TicketBot(commands.Bot):
             if isinstance(target, discord.TextChannel):
                 applicant = message.guild.get_member(record["user_id"]) or message.author
                 emb = self.staff_apps.build_review_embed(applicant, evaluation)
-                view = StaffReviewView(record["user_id"], message.channel.id)
-                await target.send(embed=emb, view=view, allowed_mentions=discord.AllowedMentions(users=True))
+                await target.send(embed=emb, view=StaffReviewView(record["user_id"], message.channel.id), allowed_mentions=discord.AllowedMentions(users=True))
             await self.safe_staff_alert(message.channel, record)
         except Exception:
             log.exception("Staff application evaluation failed")
@@ -274,10 +278,7 @@ class TicketBot(commands.Bot):
             return await interaction.response.send_message("You already have the maximum number of open tickets.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         cat = category_config(category)
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
-        }
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)}
         for rid in STAFF_ROLE_IDS:
             role = guild.get_role(rid)
             if role:
@@ -295,8 +296,7 @@ class TicketBot(commands.Bot):
         record = {"channel_id": channel.id, "guild_id": guild.id, "user_id": interaction.user.id, "user_name": str(interaction.user), "category": category, "subject": subject, "created_at": ts(), "ai_enabled": AI_ENABLED_DEFAULT, "priority": "normal", "claimed_by": None, "closed": False, "escalated": False, "messages": []}
         TICKETS[str(channel.id)] = record
         save_tickets()
-        welcome = self.ticket_welcome_embed(interaction.user, cat, subject)
-        await channel.send(content=interaction.user.mention, embed=welcome, view=TicketControlView(), allowed_mentions=discord.AllowedMentions(users=True))
+        await channel.send(content=interaction.user.mention, embed=self.ticket_welcome_embed(interaction.user, cat, subject), view=TicketControlView(), allowed_mentions=discord.AllowedMentions(users=True))
         await interaction.followup.send(f"Your ticket is ready: {channel.mention}", ephemeral=True)
         await self.log_ticket("opened", record, channel)
         if category == "staff_application":
@@ -312,12 +312,10 @@ class TicketBot(commands.Bot):
         emb.add_field(name="AI Support", value="Enabled" if AI_ENABLED_DEFAULT else "Disabled", inline=True)
         if subject:
             emb.add_field(name="Subject", value=subject[:1024], inline=False)
-        image = CONFIG.get("ticket_welcome_image", "")
-        thumb = CONFIG.get("ticket_welcome_thumbnail", "")
-        if image:
-            emb.set_image(url=image)
-        if thumb:
-            emb.set_thumbnail(url=thumb)
+        if CONFIG.get("ticket_welcome_image"):
+            emb.set_image(url=CONFIG["ticket_welcome_image"])
+        if CONFIG.get("ticket_welcome_thumbnail"):
+            emb.set_thumbnail(url=CONFIG["ticket_welcome_thumbnail"])
         return emb
 
     async def log_ticket(self, action, record, channel=None):
@@ -325,7 +323,7 @@ class TicketBot(commands.Bot):
         if not isinstance(target, discord.TextChannel):
             return
         emb = base_embed(f"Ticket {action.title()}")
-        emb.add_field(name="User", value=f"<@{record.get('user_id')}", inline=True)
+        emb.add_field(name="User", value=f"<@{record.get('user_id')}>", inline=True)
         emb.add_field(name="Category", value=record.get("category", "general"), inline=True)
         emb.add_field(name="Channel", value=channel.mention if channel else str(record.get("channel_id")), inline=True)
         await target.send(embed=emb)
@@ -368,10 +366,9 @@ class TicketBot(commands.Bot):
         for m in record.get("messages", []):
             when = datetime.fromtimestamp(m["timestamp"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             lines.append(f"[{when}] {m['author']}: {m['content']}")
-        data = "\n".join(lines).encode("utf-8")
         target = self.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else None
         if isinstance(target, discord.TextChannel):
-            await target.send(content=f"Transcript — `{channel.name}`", file=discord.File(io.BytesIO(data), filename=f"{channel.name}.txt"))
+            await target.send(content=f"Transcript — `{channel.name}`", file=discord.File(io.BytesIO("\n".join(lines).encode("utf-8")), filename=f"{channel.name}.txt"))
 
     async def ai_summary(self, record):
         if not self.groq:
@@ -400,12 +397,8 @@ class StaffReviewView(discord.ui.View):
         await interaction.response.send_message(f"Application marked **{decision}** by {interaction.user.mention}.", allowed_mentions=discord.AllowedMentions(users=True))
         channel = bot.get_channel(self.channel_id)
         if isinstance(channel, discord.TextChannel):
-            if decision == "Approved":
-                await channel.send("Your ArveX Hosting staff application has been approved. A staff member will contact you with the next steps.", allowed_mentions=discord.AllowedMentions.none())
-            elif decision == "Rejected":
-                await channel.send("Thank you for applying to ArveX Hosting. After review, we will not be proceeding with this application at this time.", allowed_mentions=discord.AllowedMentions.none())
-            else:
-                await channel.send("Your application has been placed on hold for further human review.", allowed_mentions=discord.AllowedMentions.none())
+            text = {"Approved": "Your ArveX Hosting staff application has been approved. A staff member will contact you with the next steps.", "Rejected": "Thank you for applying to ArveX Hosting. After review, we will not be proceeding with this application at this time.", "Hold": "Your application has been placed on hold for further human review."}[decision]
+            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="arvex:staff_approve")
     async def approve(self, interaction, button):
@@ -423,9 +416,7 @@ class StaffReviewView(discord.ui.View):
 class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        options = []
-        for c in CONFIG.get("categories", []):
-            options.append(discord.SelectOption(label=c.get("name", c.get("id", "General"))[:100], value=c.get("id", "general"), description=c.get("description", "Support")[:100], emoji=resolve_emoji(c.get("emoji"))))
+        options = [discord.SelectOption(label=c.get("name", c.get("id", "General"))[:100], value=c.get("id", "general"), description=c.get("description", "Support")[:100], emoji=resolve_emoji(c.get("emoji"))) for c in CONFIG.get("categories", [])]
         if not options:
             options = [discord.SelectOption(label="General Support", value="general", description="General assistance", emoji=e("ticket"))]
         select = discord.ui.Select(placeholder=CONFIG.get("panel_select_placeholder", "Select a support category…"), custom_id="arvex:ticket_category", options=options)
@@ -483,8 +474,7 @@ class TicketControlView(discord.ui.View):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         try:
-            text = await bot.ai_summary(record)
-            await interaction.followup.send(text[:4000], ephemeral=True)
+            await interaction.followup.send((await bot.ai_summary(record))[:4000], ephemeral=True)
         except Exception as exc:
             log.exception("Summary failed")
             await interaction.followup.send(f"AI summary failed: `{type(exc).__name__}`", ephemeral=True)
@@ -496,7 +486,6 @@ class TicketControlView(discord.ui.View):
 
 class RenameModal(discord.ui.Modal, title="Rename Ticket"):
     name = discord.ui.TextInput(label="New ticket name", placeholder="e.g. billing-refund", max_length=80, required=True)
-
     async def on_submit(self, interaction):
         await bot.rename_ticket(interaction, str(self.name.value))
 
@@ -573,8 +562,7 @@ async def ticket_summary(interaction):
         return await interaction.response.send_message("This is not a ticket.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
-        text = await bot.ai_summary(record)
-        await interaction.followup.send(text[:4000], ephemeral=True)
+        await interaction.followup.send((await bot.ai_summary(record))[:4000], ephemeral=True)
     except Exception as exc:
         log.exception("Summary failed")
         await interaction.followup.send(f"Summary failed: `{type(exc).__name__}`", ephemeral=True)
@@ -595,7 +583,7 @@ async def ticket_list(interaction):
 async def ticketpanel(interaction):
     if not owner_or_staff(interaction):
         return await interaction.response.send_message("Staff only.", ephemeral=True)
-    emb = base_embed(CONFIG.get("panel_title", f"{e('ticket')} ArveX Support Center"), CONFIG.get("panel_description", "Select a category below to open a private support ticket."))
+    emb = base_embed(CONFIG.get("panel_title", "ArveX Support Center"), CONFIG.get("panel_description", "Select a category below to open a private support ticket."))
     if CONFIG.get("panel_image"):
         emb.set_image(url=CONFIG["panel_image"])
     await interaction.response.send_message("Ticket panel sent.", ephemeral=True)
