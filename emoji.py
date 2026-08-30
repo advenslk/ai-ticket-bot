@@ -10,6 +10,7 @@ EMOJIS = {
     "vps": "🖥️",
     "technical": "🛠️",
     "sales": "💎",
+    "staff": "👤",
     "general": "🎫",
     "gift": "🎁",
     "sparkles": "✨",
